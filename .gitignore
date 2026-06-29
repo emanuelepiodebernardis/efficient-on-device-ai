@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+results/raw/*.json
+results/tables/*.png
+models/
+*.gguf
+.DS_Store

@@ -1,0 +1,7 @@
+numpy>=1.24
+# Real-model validation (validation/*). Not needed for the synthetic experiments.
+torch>=2.1
+transformers>=4.44
+accelerate>=0.30
+# optional, for plotting figures
+matplotlib>=3.7
