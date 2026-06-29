@@ -1,7 +1,7 @@
 __pycache__/
 *.pyc
 .venv/
-results/raw/*.json
+# results/raw/*.json (versioniamo i JSON di validazione)
 results/tables/*.png
 models/
 *.gguf

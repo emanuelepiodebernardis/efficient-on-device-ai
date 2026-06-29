@@ -23,9 +23,23 @@ def _set_module(model, name, new):
 
 
 def patch_model(model, nbits=8, per_token=False, smooth=False, alpha=0.5,
-                patch_lm_head=False, verbose=True):
+                patch_lm_head=False, verbose=True, skip_modules=None):
+    """
+    skip_modules: list of module names or name-prefixes to keep in FP (not patched).
+    A module is skipped when its dotted name equals a skip entry exactly, or starts
+    with '<entry>.' (i.e. is a sub-module of a skipped block).
+    Example: skip_modules=["model.layers.21"]  keeps the whole block in FP;
+             skip_modules=["model.layers.21.mlp.down_proj"]  keeps only that linear.
+    """
+    skip = list(skip_modules or [])
+
+    def _is_skipped(name):
+        return any(name == s or name.startswith(s + ".") for s in skip)
+
     n_lin = n_rms = 0
     for name, module in list(model.named_modules()):
+        if _is_skipped(name):
+            continue
         is_lm_head = name.endswith("lm_head")
         if isinstance(module, torch.nn.Linear) and (patch_lm_head or not is_lm_head):
             _set_module(model, name, QuantLinear(module, nbits, per_token, smooth, alpha))
@@ -36,4 +50,6 @@ def patch_model(model, nbits=8, per_token=False, smooth=False, alpha=0.5,
     if verbose:
         print(f"[patch] replaced {n_lin} Linear -> QuantLinear, {n_rms} RMSNorm -> QuantRMSNorm "
               f"(nbits={nbits}, per_token={per_token}, smooth={smooth})")
+        if skip:
+            print(f"[patch] kept in FP (skip_modules): {skip}")
     return model
