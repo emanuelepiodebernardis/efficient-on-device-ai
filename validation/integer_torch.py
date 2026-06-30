@@ -94,8 +94,14 @@ def int_silu_t(x, nbits):
 
 class QuantLinear(torch.nn.Module):
     """Drop-in replacement for nn.Linear: integer matmul with optional per-token
-    activation quant and SmoothQuant-style per-channel smoothing."""
-    def __init__(self, lin, nbits=8, per_token=False, smooth=False, alpha=0.5):
+    activation quant and SmoothQuant-style per-channel smoothing.
+
+    outlier_k=0 (default): identical behaviour to prior runs — no results change.
+    outlier_k>0: LLM.int8-style isolation — top-k input channels by activation
+    magnitude are kept in FP64; the rest are quantized as usual.
+    """
+    def __init__(self, lin, nbits=8, per_token=False, smooth=False, alpha=0.5,
+                 outlier_k=0):
         super().__init__()
         self.weight = lin.weight.detach().clone()        # (out, in)
         self.bias = None if lin.bias is None else lin.bias.detach().clone()
@@ -103,25 +109,49 @@ class QuantLinear(torch.nn.Module):
         self.per_token = per_token
         self.smooth = smooth
         self.alpha = alpha
+        self.outlier_k = outlier_k
+        self.last_outlier_idx = None
 
     def forward(self, x):
         orig_shape = x.shape
         xf = x.reshape(-1, orig_shape[-1]).to(torch.float64)
         W = self.weight.to(torch.float64)               # (out, in)
-        if self.smooth:
-            a_max = xf.abs().amax(dim=0) + 1e-9          # (in,)
-            w_max = W.abs().amax(dim=0) + 1e-9           # (in,)
-            sm = (a_max ** self.alpha) / (w_max ** (1 - self.alpha))
-            sm = sm.clamp(1e-3, 1e3)
-            xf = xf / sm
-            W = W * sm
-        qx, sx = quantize_t(xf, self.nbits, self.per_token)
-        qw, sw = quantize_perchannel_t(W, self.nbits)
-        acc = qx.double() @ qw.double().t()             # (N, out)
-        y = acc * sx * sw.t()
-        if self.bias is not None:
-            y = y + self.bias.to(torch.float64)
-        return y.reshape(*orig_shape[:-1], W.shape[0]).to(x.dtype)
+
+        if self.outlier_k > 0:
+            n_in = xf.shape[1]
+            k = min(self.outlier_k, n_in)
+            mag = xf.abs().amax(dim=0)                  # (in,)
+            idx = torch.topk(mag, k).indices             # (k,)
+            mask = torch.ones(n_in, dtype=torch.bool, device=xf.device)
+            mask[idx] = False
+            x_rest = xf[:, mask]                        # (N, in-k)
+            W_rest = W[:, mask]                         # (out, in-k)
+            x_out  = xf[:, idx]                         # (N, k)
+            W_out  = W[:, idx]                          # (out, k)
+            qx, sx = quantize_t(x_rest, self.nbits, self.per_token)
+            qw, sw = quantize_perchannel_t(W_rest, self.nbits)
+            acc = qx.double() @ qw.double().t()         # (N, out)
+            y = acc * sx * sw.t()
+            y = y + x_out @ W_out.t()
+            if self.bias is not None:
+                y = y + self.bias.to(torch.float64)
+            self.last_outlier_idx = idx.detach().cpu().tolist()
+        else:
+            if self.smooth:
+                a_max = xf.abs().amax(dim=0) + 1e-9    # (in,)
+                w_max = W.abs().amax(dim=0) + 1e-9      # (in,)
+                sm = (a_max ** self.alpha) / (w_max ** (1 - self.alpha))
+                sm = sm.clamp(1e-3, 1e3)
+                xf = xf / sm
+                W = W * sm
+            qx, sx = quantize_t(xf, self.nbits, self.per_token)
+            qw, sw = quantize_perchannel_t(W, self.nbits)
+            acc = qx.double() @ qw.double().t()         # (N, out)
+            y = acc * sx * sw.t()
+            if self.bias is not None:
+                y = y + self.bias.to(torch.float64)
+
+        return y.reshape(*orig_shape[:-1], self.weight.shape[0]).to(x.dtype)
 
 
 class QuantRMSNorm(torch.nn.Module):
