@@ -1,65 +1,54 @@
 # Efficient On-Device AI
 
-Inferenza LLM **interamente intera** (operatori non-lineari inclusi) su hardware edge economico — validazione, rimedio per l'INT8, e benchmarking edge. Progetto di ricerca finalizzato a un paper systems/measurement.
+Inferenza LLM con i **matmul interamente interi (INT8)** su hardware edge economico — progetto di ricerca finalizzato a un paper systems/measurement.
 
-**Tesi:** quanto si può abbassare la precisione di un modello mantenendolo utile, e quanto costa davvero in latenza ed energia su un dispositivo da pochi euro?
+**Tesi:** quanto si può abbassare la precisione mantenendo il modello utile, e quanto costa in latenza/energia. La risposta, in breve: i matmul (calcolo dominante) possono stare in INT8; la precisione più alta serve solo sulle RMSNorm e su pochi canali outlier delle attivazioni.
 
-## Stato
+## Stato e risultato principale
 
-| Componente | Stato |
-|---|---|
-| Operatori interi (Softmax, RMSNorm, SiLU, linear) | ✅ validati vs FP (INT16 lossless) |
-| Accumulo errore end-to-end (sintetico) | ✅ sub-lineare, non esplode |
-| Rimedio INT8 (smoothing per-canale, sintetico) | ✅ recupera la parità |
-| **Validazione su modello reale (Qwen2.5-0.5B)** | ✅ **eseguita** — INT16 lossless (PPL 1.004×); INT8 collassa a un blocco specifico |
-| **Diagnosi del collasso INT8 (layer 22)** | ✅ **causa identificata** (massive activation + drift accumulato) |
-| Rimedio INT8 su modello reale | ⏳ da progettare (smoothing offline) |
-| Benchmark su edge (Pi) | ⏳ scheletro, da eseguire (hardware) |
+- **INT16 è lossless** (perplexity ratio ~1.0038 su Qwen2.5-0.5B) ed è la **rete sicura** del progetto.
+- **L'INT8 naive collassa** perché la quantizzazione **per-tensor INT8 delle RMSNorm** non regge i **canali outlier** delle attivazioni (massive activations) — *non* per il cambio di base di un singolo blocco, come ipotizzato inizialmente. La severità del collasso scala con quanto l'outlier è concentrato.
+- **La ricetta:** RMSNorm in alta precisione (**INT16**) + isolamento di **pochi canali outlier per Linear** (indici congelati in calibrazione, statici). I matmul restano INT8 per ≥99% del calcolo.
+- **Generalizzazione (in corso):**
+  - **lossless pulito** su Qwen2.5-0.5B (K≈4 canali) e Qwen2.5-1.5B (K≈8) — il numero di canali scala col modello;
+  - su un modello **cross-famiglia a coda di outlier più grassa** (SmolLM2-1.7B) la ricetta recupera dal collasso ma **resta un gap residuo** (~1.1–1.4), tuttora in fase di diagnosi;
+  - una regola automatica semplice per scegliere il numero di canali (`mag > T·mediana`) **non trasferisce bene** tra modelli.
 
-## Scoperte chiave dalla validazione reale
+> Stato: generalizzazione multi-modello **in corso**. L'INT16-lossless è acquisito; la ricetta INT8 è solida su Qwen e in caratterizzazione cross-famiglia.
 
-- **INT16 è lossless su un modello vero**: perplexity ratio 1.004× rispetto al floating-point. La via sicura del paper è confermata.
-- **Gli outlier reali sono 2–3 ordini di grandezza oltre il sintetico**: ratio fino a 38.983× sui `mlp.down_proj`, contro i ~100–200× testati in sintetico. Questo è un finding metodologico: le valutazioni sintetiche di robustezza sottostimano il problema.
-- **L'INT8 collassa a un blocco specifico (il 21→22), non per la sola magnitudine degli outlier**: la causa è *compound* — una massive activation (un singolo canale che concentra ~97% dell'energia del residual stream) che il blocco 21 ri-distribuisce, combinata con il drift accumulato dai layer precedenti. Dettagli in `docs/stato_progetto_post_validazione_reale.md`.
+## Riprodurre i numeri chiave
 
-## Quick start
-
-Esperimenti sintetici (solo NumPy):
 ```bash
-pip install -r requirements.txt
-python experiments/spike.py
-python experiments/accumulation.py
-python experiments/realistic_stress.py
-python experiments/smoothing.py
-```
-
-Validazione su modello reale (richiede torch+transformers e accesso a Hugging Face):
-```bash
+# INT16 lossless (rete del progetto)
 python -m validation.error_vs_depth --model qwen2.5-0.5b --nbits 16
+
+# Collasso INT8 naive
 python -m validation.error_vs_depth --model qwen2.5-0.5b --nbits 8
-python -m validation.error_vs_depth --model qwen2.5-0.5b --nbits 8 --per-token --smooth
-python -m validation.outlier_stats --model qwen2.5-0.5b
-python -m validation.diagnose_block22          # diagnosi del collasso INT8
+
+# Ricetta deployable + sweep (norme INT16 + isolamento canali, statico vs dinamico)
+python -m validation.static_recipe_calib                      # qwen2.5-0.5b
+python -m validation.static_recipe_calib --model qwen2.5-1.5b
+python -m validation.static_recipe_calib --model auto-cross   # cross-famiglia (Llama->SmolLM2->OLMo)
 ```
 
-## Usare Claude Code
+## Struttura del repo
 
-Apri la cartella con Claude Code e incolla `prompts/00_master.md`. `CLAUDE.md` dà a Claude Code il contesto completo automaticamente.
-
-## Struttura
 ```
-intops/        operatori interi validati + stack sintetico
-experiments/   i quattro esperimenti sintetici
-validation/    harness PyTorch per modelli reali + diagnosi
-bench/         scheletro misure su edge
-docs/          roadmap, piano operativo, posizionamento paper, findings, stato
-prompts/       prompt per Claude Code
-results/       output degli esperimenti (JSON di validazione versionati)
+validation/
+  integer_torch.py            # operatori interi Torch (QuantLinear, QuantRMSNorm, ...)
+  integer_patch.py            # patcher HF: parametri skip_modules, outlier_k, outlier_idx_map
+  load_model.py               # caricamento modelli + fallback cross-famiglia
+  error_vs_depth.py           # driver base: errore per strato + perplexity
+  static_recipe_calib.py      # ricetta deployable, model-agnostic, sweep statico/auto-K/dinamico
+  ...                         # altri driver di sweep e diagnosi
+results/raw/                  # JSON dei risultati (evidenza numerica)
+docs/                         # documenti di progetto, handoff, findings
 ```
 
-## Documenti chiave
-- `docs/stato_progetto_post_validazione_reale.md` — stato attuale: cosa fatto, scoperto, e cosa manca.
-- `docs/paper_positioning.md` — gap, domande di ricerca, baseline, figure-target.
-- `docs/findings_validazione.md` — tutta l'evidenza sperimentale sintetica.
-- `docs/piano_operativo_fase0_fase1.md` — hardware, comandi, scheda-metriche per l'edge.
-- `docs/roadmap.md` — il programma completo, dalla MVP alla frontiera.
+## Documentazione
+
+Per il percorso completo, la diagnosi dettagliata e il piano, vedi `docs/` — in particolare il file di handoff più recente.
+
+## Caveat
+
+La softmax dell'attention è ancora in FP nella passata corrente; l'integrazione intera è prevista come passata successiva. I matmul interi sono valutati via float64 degli operandi interi (esatti per le magnitudini in gioco).
